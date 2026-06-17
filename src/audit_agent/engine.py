@@ -32,7 +32,12 @@ class PerceptionEngine(Protocol):
 
 def _image_mentions(image_paths: list[str]) -> str:
     # The verified vision recipe references each image by an @"<absolute path>"
-    # mention; Claude reads the file via its Read tool.
+    # mention; Claude reads the file via its Read tool. A double quote in a path
+    # would break the mention, so reject such paths rather than emit a broken one.
+    for p in image_paths:
+        if '"' in p:
+            raise ValueError(f"image path contains a double quote, which cannot be "
+                             f"safely referenced: {p!r}")
     return " ".join(f'@"{p}"' for p in image_paths)
 
 
@@ -50,11 +55,12 @@ class ClaudeCPEngine:
 
     name = "claude-cp"
 
-    def __init__(self, model: str = "claude-opus-4-8", timeout: int = 240,
-                 binary: str = "claude"):
+    def __init__(self, model: str = "claude-opus-4-8", timeout: int = 600,
+                 binary: str = "claude", retries: int = 1):
         self.model = model
         self.timeout = timeout
         self.binary = binary
+        self.retries = retries
 
     def extract(self, system_prompt: str, user_prompt: str,
                 image_paths: list[str], json_schema: dict) -> ExtractionResult:
@@ -70,9 +76,18 @@ class ClaudeCPEngine:
         if system_prompt:
             cmd += ["--append-system-prompt", system_prompt]
 
-        proc = subprocess.run(
-            cmd, input=prompt, capture_output=True, text=True, timeout=self.timeout
-        )
+        # A real multi-image Opus vision call can be slow; retry on timeout so a
+        # single slow extraction does not abort the whole run.
+        attempt = 0
+        while True:
+            try:
+                proc = subprocess.run(cmd, input=prompt, capture_output=True,
+                                      text=True, timeout=self.timeout)
+                break
+            except subprocess.TimeoutExpired:
+                attempt += 1
+                if attempt > self.retries:
+                    raise
         if proc.returncode != 0:
             raise RuntimeError(
                 f"claude -p exited {proc.returncode}: {proc.stderr.strip()[:500]}"
@@ -124,13 +139,14 @@ class StubEngine:
             data = self._responses(system_prompt, user_prompt, image_paths)
         else:
             key = self._route(system_prompt, user_prompt, image_paths) if self._route else None
-            data = self._responses[key] if key is not None else next(iter(self._responses.values()))
+            if key is not None:
+                data = self._responses[key]
+            elif self._responses:
+                data = next(iter(self._responses.values()))
+            else:
+                raise RuntimeError(
+                    "StubEngine has no canned response: it cannot perceive "
+                    "evidence. Use the 'claude-cp' engine for controls that need "
+                    "perception (e.g. independent-code-review)."
+                )
         return ExtractionResult(data=dict(data), model_id=self._model_id, raw={})
-
-
-def build_engine(name: str) -> PerceptionEngine:
-    if name == "claude-cp":
-        return ClaudeCPEngine()
-    if name == "stub":
-        return StubEngine(responses={}, route=lambda *a: None)
-    raise ValueError(f"unknown engine {name!r}")
