@@ -8,11 +8,16 @@ fact sheets so the test suite runs offline and deterministically.
 
 from __future__ import annotations
 
+import base64
 import json
+import os
 import re
 import subprocess
 from dataclasses import dataclass, field
 from typing import Callable, Protocol, runtime_checkable
+
+_MEDIA_TYPES = {".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg",
+                ".gif": "image/gif", ".webp": "image/webp"}
 
 
 @dataclass
@@ -31,27 +36,26 @@ class PerceptionEngine(Protocol):
         ...
 
 
-def _image_mentions(image_paths: list[str]) -> str:
-    # The verified vision recipe references each image by an @"<absolute path>"
-    # mention; Claude reads the file via its Read tool. A double quote in a path
-    # would break the mention, so reject such paths rather than emit a broken one.
-    for p in image_paths:
-        if '"' in p:
-            raise ValueError(f"image path contains a double quote, which cannot be "
-                             f"safely referenced: {p!r}")
-    return " ".join(f'@"{p}"' for p in image_paths)
+def _media_type(path: str) -> str:
+    return _MEDIA_TYPES.get(os.path.splitext(path)[1].lower(), "image/png")
 
 
 class ClaudeCPEngine:
     """Calls Claude Opus 4.8 via ``claude -p`` with schema-constrained output.
 
-    Verified invocation (claude v2.1.179): vision through @"path" mentions,
-    ``--allowedTools Read --permission-mode bypassPermissions`` so file reads
-    do not prompt, ``--output-format json --json-schema <schema>`` so the
-    validated object lands in ``envelope["structured_output"]`` (the ``result``
-    field may wrap JSON in markdown fences, so it is never parsed). There is no
-    temperature/seed flag; reproducibility comes from schema-constrained output
-    plus the caller's double-extraction stability check.
+    Images are sent INLINE as base64 content blocks over a stream-json stdin
+    message, and the call grants NO tools (``--allowedTools ""``). This is the
+    security boundary: because the model has no Read/Bash tool, a maliciously
+    crafted screenshot cannot make the agent read or exfiltrate other files
+    (prompt injection has nothing to act with). Contrast the simpler but unsafe
+    ``@"path"`` + ``--allowedTools Read --permission-mode bypassPermissions``
+    recipe, which grants whole-filesystem read access to untrusted input.
+
+    ``--json-schema`` puts the validated object in the stream-json result
+    message's ``structured_output``; ``result`` is prose (possibly fenced JSON)
+    used only as a recovery fallback. There is no temperature/seed flag, so
+    reproducibility comes from schema-constrained output plus the caller's
+    double-extraction stability check. Verified on claude CLI v2.1.179.
     """
 
     name = "claude-cp"
@@ -65,17 +69,25 @@ class ClaudeCPEngine:
 
     def extract(self, system_prompt: str, user_prompt: str,
                 image_paths: list[str], json_schema: dict) -> ExtractionResult:
-        prompt = f"{_image_mentions(image_paths)}\n\n{user_prompt}".strip()
+        text = f"{system_prompt}\n\n{user_prompt}".strip() if system_prompt else user_prompt
+        content: list[dict] = [{"type": "text", "text": text}]
+        for path in image_paths:
+            with open(path, "rb") as fh:
+                b64 = base64.b64encode(fh.read()).decode()
+            content.append({"type": "image", "source": {
+                "type": "base64", "media_type": _media_type(path), "data": b64}})
+        stdin_msg = json.dumps(
+            {"type": "user", "message": {"role": "user", "content": content}}) + "\n"
+
         cmd = [
             self.binary, "-p",
             "--model", self.model,
-            "--allowedTools", "Read",
-            "--permission-mode", "bypassPermissions",
-            "--output-format", "json",
+            "--input-format", "stream-json",
+            "--output-format", "stream-json",
+            "--verbose",
+            "--allowedTools", "",   # grant NO tools: untrusted images cannot read files
             "--json-schema", json.dumps(json_schema),
         ]
-        if system_prompt:
-            cmd += ["--append-system-prompt", system_prompt]
 
         # A real multi-image Opus vision call can be slow or, occasionally, return
         # its answer as prose in `result` with a null structured_output. Both are
@@ -83,37 +95,48 @@ class ClaudeCPEngine:
         last_error: Exception | None = None
         for _ in range(self.retries + 1):
             try:
-                return self._run_once(cmd, prompt)
+                return self._run_once(cmd, stdin_msg)
             except (subprocess.TimeoutExpired, RuntimeError) as exc:
                 last_error = exc
         raise last_error
 
-    def _run_once(self, cmd: list[str], prompt: str) -> ExtractionResult:
-        proc = subprocess.run(cmd, input=prompt, capture_output=True,
+    def _run_once(self, cmd: list[str], stdin_msg: str) -> ExtractionResult:
+        proc = subprocess.run(cmd, input=stdin_msg, capture_output=True,
                               text=True, timeout=self.timeout)
         if proc.returncode != 0:
             raise RuntimeError(
                 f"claude -p exited {proc.returncode}: {proc.stderr.strip()[:500]}"
             )
-        try:
-            envelope = json.loads(proc.stdout)
-        except json.JSONDecodeError as exc:
+        # stream-json output is one JSON object per line; the final one of
+        # type "result" carries the outcome.
+        result = None
+        for line in proc.stdout.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                obj = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(obj, dict) and obj.get("type") == "result":
+                result = obj
+        if result is None:
             raise RuntimeError(
-                f"claude -p output was not JSON: {proc.stdout[:300]}"
-            ) from exc
-        if envelope.get("is_error"):
-            raise RuntimeError(f"claude -p reported an error: {envelope.get('result')}")
-        data = envelope.get("structured_output")
+                f"claude -p produced no result message: {proc.stdout[:300]}"
+            )
+        if result.get("is_error"):
+            raise RuntimeError(f"claude -p reported an error: {result.get('result')}")
+        data = result.get("structured_output")
         if data is None:
             # Fall back to recovering JSON embedded in the prose result field.
-            data = _recover_json(envelope.get("result"))
+            data = _recover_json(result.get("result"))
         if not isinstance(data, dict):
             raise RuntimeError(
                 "claude -p returned no usable structured output; "
-                f"result was {str(envelope.get('result'))[:300]}"
+                f"result was {str(result.get('result'))[:300]}"
             )
-        return ExtractionResult(data=data, model_id=_resolve_model_id(envelope, self.model),
-                                raw=envelope)
+        return ExtractionResult(data=data, model_id=_resolve_model_id(result, self.model),
+                                raw=result)
 
 
 def _recover_json(result: object) -> dict | None:

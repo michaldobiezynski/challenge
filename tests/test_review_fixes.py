@@ -196,23 +196,29 @@ def test_empty_stub_engine_raises_clear_error():
         eng.extract("sys", "usr", ["/tmp/x.png"], {})
 
 
-def test_image_path_with_quote_is_rejected():
-    eng = ClaudeCPEngine()
-    with pytest.raises(ValueError, match="double quote"):
-        eng.extract("", "go", ['/tmp/we"ird.png'], {"type": "object"})
-
-
-def test_claude_cp_parses_structured_output(monkeypatch):
-    envelope = {"is_error": False, "structured_output": {"ok": True},
-                "modelUsage": {"claude-haiku-4-5-20251001": {}, "claude-opus-4-8": {}}}
+def test_claude_cp_grants_no_tools_and_sends_inline_image(monkeypatch, tmp_path):
+    # The security boundary: no Read tool, no bypassPermissions; image inlined.
+    png = tmp_path / "shot.png"
+    png.write_bytes(b"\x89PNG\r\n\x1a\n")
+    captured = {}
 
     def fake_run(cmd, **kw):
-        return types.SimpleNamespace(returncode=0, stdout=json.dumps(envelope), stderr="")
+        captured["cmd"] = cmd
+        captured["stdin"] = kw.get("input", "")
+        line = json.dumps({"type": "result", "is_error": False,
+                           "structured_output": {"ok": True},
+                           "modelUsage": {"claude-haiku-4-5-20251001": {},
+                                          "claude-opus-4-8": {}}})
+        return types.SimpleNamespace(returncode=0, stdout=line + "\n", stderr="")
 
     monkeypatch.setattr(engine_mod.subprocess, "run", fake_run)
-    res = ClaudeCPEngine().extract("sys", "usr", [], {"type": "object"})
+    res = ClaudeCPEngine().extract("sys", "usr", [str(png)], {"type": "object"})
     assert res.data == {"ok": True}
     assert res.model_id == "claude-opus-4-8"  # the non-Haiku model is reported
+    cmd = captured["cmd"]
+    assert "Read" not in cmd and "bypassPermissions" not in cmd
+    assert cmd[cmd.index("--allowedTools") + 1] == ""  # no tools granted
+    assert '"type": "image"' in captured["stdin"]  # image inlined, not @path
 
 
 def test_recover_json_from_prose_result():
@@ -223,12 +229,12 @@ def test_recover_json_from_prose_result():
 
 def test_claude_cp_recovers_when_structured_output_null(monkeypatch):
     # The model occasionally answers in prose with a null structured_output.
-    envelope = {"is_error": False, "structured_output": None,
-                "result": "Sure:\n```json\n{\"ok\": true}\n```",
-                "modelUsage": {"claude-opus-4-8": {}}}
+    line = json.dumps({"type": "result", "is_error": False, "structured_output": None,
+                       "result": "Sure:\n```json\n{\"ok\": true}\n```",
+                       "modelUsage": {"claude-opus-4-8": {}}})
 
     def fake_run(cmd, **kw):
-        return types.SimpleNamespace(returncode=0, stdout=json.dumps(envelope), stderr="")
+        return types.SimpleNamespace(returncode=0, stdout=line + "\n", stderr="")
 
     monkeypatch.setattr(engine_mod.subprocess, "run", fake_run)
     res = ClaudeCPEngine(retries=0).extract("sys", "usr", [], {"type": "object"})
