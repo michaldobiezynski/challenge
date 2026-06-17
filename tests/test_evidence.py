@@ -43,3 +43,16 @@ def test_coerce_date_handles_datetime_serial_and_string():
 
 def test_canon():
     assert canon("Reviewer / Approver") == "reviewerapprover"
+
+
+def test_coerce_date_is_british_day_first():
+    # 03/12/2021 must read as 3 December (DD/MM), not 12 March, per conventions.
+    assert coerce_date("03/12/2021") == date(2021, 12, 3)
+
+
+def test_short_alias_does_not_misbind():
+    # "name" must not bind to "Username"; exact match keeps them distinct.
+    header = ["Username", "Full Name"]
+    manifest = {"username": ["Username"], "full_name": ["Full Name", "Name"]}
+    resolved = resolve_columns(header, manifest)
+    assert resolved == {"username": 0, "full_name": 1}
