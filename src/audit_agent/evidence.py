@@ -11,15 +11,35 @@ from __future__ import annotations
 import hashlib
 import re
 import unicodedata
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from pathlib import Path
 
 from openpyxl import load_workbook
 from openpyxl.utils import get_column_letter
 
+# Reject implausibly large workbooks before handing them to openpyxl, as a basic
+# guard against zip-bomb / resource-exhaustion in untrusted auditee files.
+MAX_WORKBOOK_BYTES = 100 * 1024 * 1024
+# Minimum alias length permitted to match a column by substring containment, to
+# avoid short aliases mis-binding (e.g. "name" matching "Username").
+MIN_SUBSTRING_ALIAS = 4
+
 
 class MissingColumnError(ValueError):
     """Raised when a required logical column cannot be resolved in a sheet."""
+
+
+class EvidenceTooLargeError(ValueError):
+    """Raised when an evidence file exceeds the safety size limit."""
+
+
+def _open_guarded(path: Path):
+    size = path.stat().st_size
+    if size > MAX_WORKBOOK_BYTES:
+        raise EvidenceTooLargeError(
+            f"{path.name} is {size} bytes, over the {MAX_WORKBOOK_BYTES}-byte limit"
+        )
+    return load_workbook(path, data_only=True, read_only=True)
 
 
 def normalise_email(value: object) -> str:
@@ -60,7 +80,8 @@ def coerce_date(value: object) -> date | None:
     if isinstance(value, date):
         return value
     if isinstance(value, (int, float)):
-        return (_EXCEL_EPOCH + _timedelta_days(float(value))).date()
+        return (_EXCEL_EPOCH + timedelta(days=float(value))).date()
+    # Date strings are read British-first (DD/MM/YYYY) per project conventions.
     text = str(value).strip()
     for fmt in ("%Y-%m-%d", "%d/%m/%Y", "%m/%d/%Y", "%Y-%m-%d %H:%M:%S"):
         try:
@@ -70,18 +91,15 @@ def coerce_date(value: object) -> date | None:
     return None
 
 
-def _timedelta_days(days: float):
-    from datetime import timedelta
-
-    return timedelta(days=days)
-
-
 def find_sheet_name(sheet_names: list[str], candidates: list[str]) -> str | None:
-    """Resolve a sheet by fuzzy match against candidate names."""
+    """Resolve a sheet by fuzzy match, preferring an exact canonical match."""
     wanted = [canon(c) for c in candidates]
-    for name in sheet_names:
+    for name in sheet_names:  # exact canonical match wins regardless of order
+        if canon(name) in wanted:
+            return name
+    for name in sheet_names:  # then fall back to substring containment
         cname = canon(name)
-        if any(cname == w or w in cname or cname in w for w in wanted):
+        if any(w and (w in cname or cname in w) for w in wanted):
             return name
     return None
 
@@ -110,12 +128,15 @@ def resolve_columns(header: list[object], manifest: dict[str, list[str]]) -> dic
 
 def _match_column(canon_header: list[str], aliases: list[str]) -> int | None:
     canon_aliases = [canon(a) for a in aliases]
-    # Exact canonical match first, then substring containment.
+    # Exact canonical match first.
     for idx, h in enumerate(canon_header):
         if h and h in canon_aliases:
             return idx
+    # Then substring containment, but only where the alias is contained in the
+    # header (directional) and long enough to be specific. This stops short
+    # aliases such as "name" from mis-binding to "Username".
     for idx, h in enumerate(canon_header):
-        if h and any(a and (a in h or h in a) for a in canon_aliases):
+        if h and any(a and len(a) >= MIN_SUBSTRING_ALIAS and a in h for a in canon_aliases):
             return idx
     return None
 
@@ -143,15 +164,17 @@ def load_table(path: str | Path, sheet_candidates: list[str],
                manifest: dict[str, list[str]], header_scan_rows: int = 12) -> Table:
     """Load a sheet into a :class:`Table`, resolving sheet and columns fuzzily."""
     path = Path(path)
-    wb = load_workbook(path, data_only=True, read_only=True)
-    sheet_name = find_sheet_name(wb.sheetnames, sheet_candidates)
-    if sheet_name is None:
-        raise MissingColumnError(
-            f"no sheet matching {sheet_candidates} in {path.name} "
-            f"(have {wb.sheetnames})"
-        )
-    ws = wb[sheet_name]
-    rows = list(ws.iter_rows(values_only=True))
+    wb = _open_guarded(path)
+    try:
+        sheet_name = find_sheet_name(wb.sheetnames, sheet_candidates)
+        if sheet_name is None:
+            raise MissingColumnError(
+                f"no sheet matching {sheet_candidates} in {path.name} "
+                f"(have {wb.sheetnames})"
+            )
+        rows = list(wb[sheet_name].iter_rows(values_only=True))
+    finally:
+        wb.close()
 
     header_idx, col_map = _detect_header(rows[:header_scan_rows], manifest)
     col_letters = {logical: get_column_letter(idx + 1) for logical, idx in col_map.items()}
@@ -163,7 +186,6 @@ def load_table(path: str | Path, sheet_candidates: list[str],
         record = {logical: _cell(raw, idx) for logical, idx in col_map.items()}
         record["_row"] = offset
         records.append(record)
-    wb.close()
     return Table(path.name, sheet_name, col_letters, records)
 
 
@@ -173,6 +195,8 @@ def _cell(raw: tuple, idx: int):
 
 def _detect_header(rows: list[tuple], manifest: dict[str, list[str]]) -> tuple[int, dict[str, int]]:
     """Find the header row that resolves the most manifest columns."""
+    if not rows:
+        raise MissingColumnError(f"sheet is empty; cannot resolve columns {list(manifest)}")
     best_idx, best_map, best_score = None, None, -1
     for idx, raw in enumerate(rows):
         try:
@@ -195,18 +219,18 @@ def load_key_value(path: str | Path, sheet_candidates: list[str]) -> dict[str, t
     Returns ``{key: (value, cell_ref)}`` so values can be cited.
     """
     path = Path(path)
-    wb = load_workbook(path, data_only=True, read_only=True)
-    sheet_name = find_sheet_name(wb.sheetnames, sheet_candidates)
-    if sheet_name is None:
+    wb = _open_guarded(path)
+    try:
+        sheet_name = find_sheet_name(wb.sheetnames, sheet_candidates)
+        if sheet_name is None:
+            return {}
+        out: dict[str, tuple] = {}
+        for row_idx, raw in enumerate(wb[sheet_name].iter_rows(values_only=True), start=1):
+            if not raw or raw[0] in (None, ""):
+                continue
+            key = str(raw[0]).strip().rstrip(":")
+            value = raw[1] if len(raw) > 1 else None
+            out[key] = (value, f"{path.name}!{sheet_name}!B{row_idx}")
+        return out
+    finally:
         wb.close()
-        return {}
-    ws = wb[sheet_name]
-    out: dict[str, tuple] = {}
-    for row_idx, raw in enumerate(ws.iter_rows(values_only=True), start=1):
-        if not raw or raw[0] in (None, ""):
-            continue
-        key = str(raw[0]).strip().rstrip(":")
-        value = raw[1] if len(raw) > 1 else None
-        out[key] = (value, f"{path.name}!{sheet_name}!B{row_idx}")
-    wb.close()
-    return out
