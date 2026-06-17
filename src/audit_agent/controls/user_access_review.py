@@ -35,7 +35,9 @@ PROMPT_VERSION = None  # no LLM perception is used for this control
 # Tunable thresholds, surfaced in every assessment's thresholds_used.
 DORMANT_DAYS = 180
 PRIVILEGED_ROLE_TOKENS = ("administrator", "admin")
-REMEDIATION_SLA_DAYS = 30
+# Tokens that evidence remediation having been initiated for a flagged exception.
+REMEDIATION_TOKENS = ("ticket", "itsm", "deprovision", "revoke", "raised", "removed",
+                      "disabled", "jira", "snow")
 
 ACCESS_MANIFEST = {
     "username": ["Username", "User Name", "Login"],
@@ -119,13 +121,15 @@ def assess(sample_dir: Path, engine: PerceptionEngine | None = None) -> list[Att
         nm = f"{rec.get('first_name')} {rec.get('last_name')}".strip().lower()
         hris_by_name.setdefault(nm, []).append(rec)
 
-    review_by_email = {normalise_email(r.get("email")): r for r in review.records}
-    reviewer_revoked = {
-        e for e, r in review_by_email.items()
-        if str(r.get("decision") or "").strip().lower() == "revoke"
-    }
+    # Build the reviewer's revoke set from ALL worksheet rows, not a deduped
+    # email->row map: a duplicated email must not let a later Retain silently
+    # overwrite (and drop) an earlier Revoke decision.
+    revoke_records = [r for r in review.records
+                      if str(r.get("decision") or "").strip().lower() == "revoke"]
+    reviewer_revoked = {normalise_email(r.get("email")) for r in revoke_records}
+    revoke_by_email = {normalise_email(r.get("email")): r for r in revoke_records}
 
-    review_end = coerce_date(cover.get("Review Completed", (None,))[0]) or date.today()
+    review_end = coerce_date(cover.get("Review Completed", (None,))[0])  # None if absent
     findings: list[Finding] = []
     service_accounts: list[str] = []
     in_scope = 0
@@ -163,9 +167,16 @@ def assess(sample_dir: Path, engine: PerceptionEngine | None = None) -> list[Att
                 ))
                 continue
 
-        primary = _hris_primary(matches)
-        status = str(primary.get("employment_status") or "").strip().lower()
-        if status == "terminated":
+        # Classify by the full set of HRIS spells for this worker: any current
+        # (Active/On Leave) spell means the worker is employed, even if an older
+        # Terminated spell also exists (rehire / concurrent spells). Only flag
+        # when there is NO current spell and a Terminated one exists.
+        statuses = {str(m.get("employment_status") or "").strip().lower() for m in matches}
+        currently_employed = bool(statuses & {"active", "on leave", "on-leave", "leave"})
+        if not currently_employed and "terminated" in statuses:
+            terminated = [m for m in matches
+                          if str(m.get("employment_status") or "").strip().lower() == "terminated"]
+            primary = _hris_primary(terminated or matches)
             term = coerce_date(primary.get("termination_date"))
             findings.append(Finding(
                 type=FindingType.TERMINATED_ACTIVE, subject=email,
@@ -175,7 +186,7 @@ def assess(sample_dir: Path, engine: PerceptionEngine | None = None) -> list[Att
                 evidence=[
                     EvidenceRef(source=src, detail="Account Status=Active"),
                     EvidenceRef(source=hris.cell_ref("employment_status", primary),
-                                detail=f"HRIS Employment Status=Terminated"),
+                                detail="HRIS Employment Status=Terminated"),
                 ],
             ))
             continue
@@ -186,15 +197,14 @@ def assess(sample_dir: Path, engine: PerceptionEngine | None = None) -> list[Att
 
     reviewer_findings = [
         {"email": e, "decision": "Revoke",
-         "comment": str(review_by_email[e].get("comment") or ""),
-         "source": review.cell_ref("decision", review_by_email[e])}
+         "comment": str(revoke_by_email[e].get("comment") or ""),
+         "source": review.cell_ref("decision", revoke_by_email[e])}
         for e in sorted(reviewer_revoked)
     ]
 
     thresholds = {
         "dormant_days": DORMANT_DAYS,
         "privileged_role_tokens": list(PRIVILEGED_ROLE_TOKENS),
-        "remediation_sla_days": REMEDIATION_SLA_DAYS,
     }
     common = dict(
         inputs_hash=inputs_hash, thresholds_used=thresholds,
@@ -213,15 +223,22 @@ def assess(sample_dir: Path, engine: PerceptionEngine | None = None) -> list[Att
     return [
         _attr_periodic(sample_dir, cover, common, assumptions),
         _attr_owner(sample_dir, cover, common, assumptions),
-        _attr_remediation(sample_dir, findings, reviewer_revoked, service_accounts,
-                          in_scope, common, assumptions),
+        _attr_remediation(sample_dir, findings, reviewer_revoked, revoke_by_email,
+                          service_accounts, in_scope, common, assumptions),
     ]
 
 
-def _advisory_checks(acc: dict, access, review_end: date, findings: list[Finding]) -> None:
+def _has_remediation_evidence(comment: object) -> bool:
+    text = str(comment or "").lower()
+    return any(tok in text for tok in REMEDIATION_TOKENS)
+
+
+def _advisory_checks(acc: dict, access, review_end: date | None, findings: list[Finding]) -> None:
     email = normalise_email(acc.get("email"))
     last_login = coerce_date(acc.get("last_login"))
-    if last_login and (review_end - last_login).days > DORMANT_DAYS:
+    # Dormancy is measured against the review end date; if that is unknown we
+    # cannot judge dormancy reliably (do not silently fall back to today()).
+    if review_end and last_login and (review_end - last_login).days > DORMANT_DAYS:
         findings.append(Finding(
             type=FindingType.DORMANT, subject=email, severity=Severity.ADVISORY,
             detail=f"last login {last_login.isoformat()} exceeds {DORMANT_DAYS}-day dormancy threshold",
@@ -299,12 +316,17 @@ def _attr_owner(sample_dir, cover, common, assumptions) -> AttributeAssessment:
     )
 
 
-def _attr_remediation(sample_dir, findings, reviewer_revoked, service_accounts,
-                      in_scope, common, assumptions) -> AttributeAssessment:
+def _attr_remediation(sample_dir, findings, reviewer_revoked, revoke_by_email,
+                      service_accounts, in_scope, common, assumptions) -> AttributeAssessment:
     exceptions = [f for f in findings if f.severity == Severity.EXCEPTION]
     advisories = [f for f in findings if f.severity == Severity.ADVISORY]
     missed = [f for f in exceptions if f.subject not in reviewer_revoked]
     agreed = [f for f in exceptions if f.subject in reviewer_revoked]
+    # An agreed exception is "remediated" only if its worksheet comment evidences
+    # remediation having been initiated (a ticket, deprovisioning, etc.).
+    unremediated = [f for f in agreed
+                    if not _has_remediation_evidence(
+                        (revoke_by_email.get(f.subject) or {}).get("comment"))]
 
     evidence = [e for f in exceptions for e in f.evidence]
     discrepancy = bool(missed)
@@ -320,11 +342,19 @@ def _attr_remediation(sample_dir, findings, reviewer_revoked, service_accounts,
             "Control attribute fails: excessive access was not caught and remediated."
         )
         confidence = 0.95
+    elif exceptions and unremediated:
+        conclusion = Conclusion.FURTHER_EVIDENCE_REQUIRED
+        rationale = (
+            f"All {len(exceptions)} exception(s) were flagged by the reviewer, but "
+            f"remediation is not evidenced for: {', '.join(f.subject for f in unremediated)}. "
+            "Timeliness of remediation cannot be confirmed from the worksheet."
+        )
+        confidence = 0.6
     elif exceptions:
         conclusion = Conclusion.SUCCESS
         rationale = (
             f"All {len(exceptions)} exception(s) found on reperformance were also "
-            f"flagged by the reviewer for revocation and remediation: "
+            f"flagged by the reviewer for revocation, with remediation evidenced: "
             f"{', '.join(f.subject for f in agreed)}."
         )
         confidence = 0.85
