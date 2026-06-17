@@ -136,14 +136,14 @@ account the reviewer missed).
 
 ## Security note (threat model)
 
-Control 1 sends auditee-supplied PR screenshots to `claude -p` running with
-`--permission-mode bypassPermissions` and the `Read` tool. A maliciously crafted
-screenshot could attempt prompt injection to make the agent read other files.
-The evidence is **untrusted input**. Run this tool in an isolated environment
-(a container or throwaway working directory containing only the evidence), not
-with access to secrets or a home directory. The XLSX loader applies a basic
-file-size guard, and image paths containing a double quote are rejected. Fully
-sandboxing the `Read` tool to the evidence directory is tracked as future work.
+Control 1 feeds auditee-supplied PR screenshots to a language model, so the
+evidence is **untrusted input** and a crafted screenshot could attempt prompt
+injection. The agent is sandboxed against this: images are sent to `claude -p`
+**inline as base64 content blocks** over a stream-json message, and the call
+grants **no tools** (`--allowedTools ""`, no `Read`, no `bypassPermissions`).
+With no filesystem tool available, an injected instruction in a screenshot has
+nothing to act with, so it cannot read or exfiltrate other files. The XLSX
+loader additionally applies a file-size guard against zip-bomb style inputs.
 
 ## Tests
 
