@@ -144,26 +144,48 @@ def test_commented_only_is_not_an_approval(tmp_path):
     assert res["ICR-b"].conclusion is Conclusion.FURTHER_EVIDENCE_REQUIRED
 
 
-# --- F2: the stability projection is sensitive to decision-critical fields ---
+# --- F2: instability on a decision-critical field flips that attribute to FER,
+#         but a harmless confidence-only difference does not. ---
 
-def test_canonical_sensitive_to_before_merge():
+def _alternating_assess(facts_a, facts_b, tmp_path):
+    (tmp_path / "s.png").write_bytes(b"\x89PNG")
+    state = {"n": 0}
+
+    def fn(*a):
+        state["n"] += 1
+        return facts_a if state["n"] % 2 == 1 else facts_b
+
+    return _by_id(icr.assess(tmp_path, StubEngine(responses=fn)))
+
+
+def test_before_merge_flip_makes_timing_unstable(tmp_path):
     a = dict(BASE_FACTS, reviews=[{"reviewer": "b", "is_bot": False, "state": "APPROVED",
                                    "before_merge": True}])
     b = dict(BASE_FACTS, reviews=[{"reviewer": "b", "is_bot": False, "state": "APPROVED",
                                    "before_merge": False}])
-    assert icr._canonical(a) != icr._canonical(b)
+    res = _alternating_assess(a, b, tmp_path)
+    assert res["ICR-a"].conclusion is Conclusion.FURTHER_EVIDENCE_REQUIRED
+    assert res["ICR-b"].conclusion is Conclusion.SUCCESS  # independence verdict unaffected
 
 
-def test_canonical_sensitive_to_coverage_threshold_crossing():
+def test_coverage_threshold_crossing_makes_testing_unstable(tmp_path):
     a = dict(BASE_FACTS, coverage={"line": 79.6, "branch": 90, "function": 90})
     b = dict(BASE_FACTS, coverage={"line": 80.4, "branch": 90, "function": 90})
-    assert icr._canonical(a) != icr._canonical(b)
+    res = _alternating_assess(a, b, tmp_path)
+    assert res["ICR-c"].conclusion is Conclusion.FURTHER_EVIDENCE_REQUIRED
 
 
-def test_canonical_sensitive_to_change_categories():
-    a = dict(BASE_FACTS, change_categories=["docs-only"])
-    b = dict(BASE_FACTS, change_categories=[])
-    assert icr._canonical(a) != icr._canonical(b)
+def test_confidence_only_difference_is_still_stable(tmp_path):
+    # One pass reads the approver, the other is unsure on before_merge; both still
+    # conclude an independent approval before merge, so the verdict is stable.
+    a = dict(BASE_FACTS, reviews=[{"reviewer": "b", "is_bot": False, "state": "APPROVED",
+                                   "before_merge": True}])
+    b = dict(BASE_FACTS, reviews=[{"reviewer": "b", "is_bot": False, "state": "APPROVED",
+                                   "before_merge": None}])
+    res = _alternating_assess(a, b, tmp_path)
+    # ICR-a: pass1 SUCCESS (before True), pass2 FER (ordering unknown) -> unstable.
+    # ICR-b: both SUCCESS (independent approval) -> stable SUCCESS.
+    assert res["ICR-b"].conclusion is Conclusion.SUCCESS
 
 
 # --- F5 / F19: engine robustness ---
@@ -191,6 +213,41 @@ def test_claude_cp_parses_structured_output(monkeypatch):
     res = ClaudeCPEngine().extract("sys", "usr", [], {"type": "object"})
     assert res.data == {"ok": True}
     assert res.model_id == "claude-opus-4-8"  # the non-Haiku model is reported
+
+
+def test_recover_json_from_prose_result():
+    assert engine_mod._recover_json("```json\n{\"a\": 1}\n```") == {"a": 1}
+    assert engine_mod._recover_json("here you go: {\"b\": 2} cheers") == {"b": 2}
+    assert engine_mod._recover_json("no json at all") is None
+
+
+def test_claude_cp_recovers_when_structured_output_null(monkeypatch):
+    # The model occasionally answers in prose with a null structured_output.
+    envelope = {"is_error": False, "structured_output": None,
+                "result": "Sure:\n```json\n{\"ok\": true}\n```",
+                "modelUsage": {"claude-opus-4-8": {}}}
+
+    def fake_run(cmd, **kw):
+        return types.SimpleNamespace(returncode=0, stdout=json.dumps(envelope), stderr="")
+
+    monkeypatch.setattr(engine_mod.subprocess, "run", fake_run)
+    res = ClaudeCPEngine(retries=0).extract("sys", "usr", [], {"type": "object"})
+    assert res.data == {"ok": True}
+
+
+def test_icr_extraction_failure_yields_further_evidence(tmp_path):
+    (tmp_path / "s.png").write_bytes(b"\x89PNG")
+
+    class FailingEngine:
+        name = "failing"
+
+        def extract(self, *a, **k):
+            raise RuntimeError("perception broke")
+
+    res = _by_id(icr.assess(tmp_path, FailingEngine()))
+    assert all(v.conclusion is Conclusion.FURTHER_EVIDENCE_REQUIRED for v in res.values())
+    assert all(any(f.type is FindingType.UNSTABLE_EXTRACTION for f in v.agent_findings)
+               for v in res.values())
 
 
 # --- F30: core helpers and routing ---

@@ -115,10 +115,14 @@ def test_docs_only_change_is_exempt(tmp_path):
 
 
 def test_unstable_extraction_is_further_evidence(tmp_path):
+    """When two passes reach different verdicts for an attribute, it FERs."""
     png = tmp_path / "shot.png"
     png.write_bytes(b"\x89PNG\r\n")
-    other = dict(TYPESCRIPT_LIKE, pr_author="someone-else", merged=False)
+    # Pass 2 differs only in that the merge is not visible -> ICR-a verdict flips.
+    other = dict(TYPESCRIPT_LIKE, merged=False)
     res = _assess(_alternating(TYPESCRIPT_LIKE, other), tmp_path)
-    assert all(a.conclusion is Conclusion.FURTHER_EVIDENCE_REQUIRED for a in res.values())
+    assert res["ICR-a"].conclusion is Conclusion.FURTHER_EVIDENCE_REQUIRED
     assert any(f.type is FindingType.UNSTABLE_EXTRACTION
-               for a in res.values() for f in a.agent_findings)
+               for f in res["ICR-a"].agent_findings)
+    # The independence verdict is unaffected by the merge visibility.
+    assert res["ICR-b"].conclusion is Conclusion.SUCCESS
