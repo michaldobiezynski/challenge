@@ -116,7 +116,8 @@ account the reviewer missed).
 ## Design decisions and limitations
 
 - **openpyxl, not pandas, for loading**: it preserves cell coordinates so every
-  finding can cite an exact cell. pandas remains a declared dependency.
+  finding can cite an exact cell, which a DataFrame loses. pandas was therefore
+  not needed and is not a dependency.
 - **Sheets and columns are resolved by fuzzy header match** against a required
   column manifest; a missing required column fails loudly rather than producing
   a silent wrong answer. Counts, sheet names, and the `svc-` prefix are not
@@ -130,6 +131,17 @@ account the reviewer missed).
   control, so reproducibility comes from schema-constrained output plus the
   double-extraction stability check. Decisions are pure functions of the
   extracted facts.
+
+## Security note (threat model)
+
+Control 1 sends auditee-supplied PR screenshots to `claude -p` running with
+`--permission-mode bypassPermissions` and the `Read` tool. A maliciously crafted
+screenshot could attempt prompt injection to make the agent read other files.
+The evidence is **untrusted input**. Run this tool in an isolated environment
+(a container or throwaway working directory containing only the evidence), not
+with access to secrets or a home directory. The XLSX loader applies a basic
+file-size guard, and image paths containing a double quote are rejected. Fully
+sandboxing the `Read` tool to the evidence directory is tracked as future work.
 
 ## Tests
 
