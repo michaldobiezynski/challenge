@@ -10,7 +10,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from ..engine import ExtractionResult, PerceptionEngine
+from ..engine import PerceptionEngine
 from ..evidence import sha256_file
 from ..schema import (
     AttributeAssessment,
@@ -29,8 +29,6 @@ KNOWN_BOTS = ("copilot", "dependabot", "renovate", "github-actions", "codecov")
 EXEMPT_TOKENS = ("docs", "documentation", "dependency", "dependencies", "refactor",
                  "build", "ci", "third-party", "third party", "poc",
                  "proof of concept", "legacy")
-INVALID_REVIEW_STATES = {"DISMISSED", "STALE", "CHANGES_REQUESTED", "COMMENTED",
-                         "PENDING", "UNKNOWN"}
 
 SYSTEM_PROMPT = (
     "You are an audit perception agent. You read GitHub pull-request screenshots "
@@ -91,23 +89,46 @@ FACT_SCHEMA = {
 
 
 def _canonical(facts: dict) -> tuple:
-    """A hashable projection used to test extraction stability."""
+    """A hashable projection used to test extraction stability.
+
+    It must include every field a decision depends on, otherwise two passes that
+    disagree on a decision-critical field would be wrongly judged stable. So it
+    carries before_merge (decides ICR-a timing), change_categories (decides the
+    ICR-c exemption), and coverage compared at threshold precision rather than
+    rounded to an integer (which would mask a 79.6 vs 80.4 flip across the 80%
+    line threshold).
+    """
     author = str(facts.get("pr_author") or "").strip().lower()
     reviews = sorted(
         (str(r.get("reviewer") or "").strip().lower(), bool(r.get("is_bot")),
-         str(r.get("state") or ""))
+         str(r.get("state") or ""), _tri(r.get("before_merge")))
         for r in facts.get("reviews") or []
     )
+    cats = tuple(sorted(str(c).strip().lower() for c in facts.get("change_categories") or []))
     cov = facts.get("coverage") or {}
 
-    def r(x):
-        return round(float(x)) if isinstance(x, (int, float)) else None
+    def side(x, threshold):
+        # Compare which side of the policy threshold the figure falls on, so any
+        # threshold-crossing change is treated as a difference.
+        if not isinstance(x, (int, float)):
+            return None
+        return x >= threshold
 
     return (
-        author, bool(facts.get("merged")), tuple(reviews),
+        author, bool(facts.get("merged")), tuple(reviews), cats,
         bool(facts.get("coverage_report_present")),
-        (r(cov.get("line")), r(cov.get("branch")), r(cov.get("function"))),
+        (side(cov.get("line"), LINE_MIN), side(cov.get("branch"), BRANCH_MIN),
+         side(cov.get("function"), FUNCTION_MIN)),
     )
+
+
+def _tri(value) -> str:
+    """Three-valued projection of an optional boolean (True/False/unknown)."""
+    if value is True:
+        return "T"
+    if value is False:
+        return "F"
+    return "?"
 
 
 def assess(control_dir: Path, engine: PerceptionEngine) -> list[AttributeAssessment]:
