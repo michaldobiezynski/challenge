@@ -9,6 +9,7 @@ fact sheets so the test suite runs offline and deterministically.
 from __future__ import annotations
 
 import json
+import re
 import subprocess
 from dataclasses import dataclass, field
 from typing import Callable, Protocol, runtime_checkable
@@ -56,7 +57,7 @@ class ClaudeCPEngine:
     name = "claude-cp"
 
     def __init__(self, model: str = "claude-opus-4-8", timeout: int = 600,
-                 binary: str = "claude", retries: int = 1):
+                 binary: str = "claude", retries: int = 2):
         self.model = model
         self.timeout = timeout
         self.binary = binary
@@ -76,18 +77,20 @@ class ClaudeCPEngine:
         if system_prompt:
             cmd += ["--append-system-prompt", system_prompt]
 
-        # A real multi-image Opus vision call can be slow; retry on timeout so a
-        # single slow extraction does not abort the whole run.
-        attempt = 0
-        while True:
+        # A real multi-image Opus vision call can be slow or, occasionally, return
+        # its answer as prose in `result` with a null structured_output. Both are
+        # transient, so retry rather than abort the whole run on a single bad pass.
+        last_error: Exception | None = None
+        for _ in range(self.retries + 1):
             try:
-                proc = subprocess.run(cmd, input=prompt, capture_output=True,
-                                      text=True, timeout=self.timeout)
-                break
-            except subprocess.TimeoutExpired:
-                attempt += 1
-                if attempt > self.retries:
-                    raise
+                return self._run_once(cmd, prompt)
+            except (subprocess.TimeoutExpired, RuntimeError) as exc:
+                last_error = exc
+        raise last_error
+
+    def _run_once(self, cmd: list[str], prompt: str) -> ExtractionResult:
+        proc = subprocess.run(cmd, input=prompt, capture_output=True,
+                              text=True, timeout=self.timeout)
         if proc.returncode != 0:
             raise RuntimeError(
                 f"claude -p exited {proc.returncode}: {proc.stderr.strip()[:500]}"
@@ -102,12 +105,38 @@ class ClaudeCPEngine:
             raise RuntimeError(f"claude -p reported an error: {envelope.get('result')}")
         data = envelope.get("structured_output")
         if data is None:
+            # Fall back to recovering JSON embedded in the prose result field.
+            data = _recover_json(envelope.get("result"))
+        if not isinstance(data, dict):
             raise RuntimeError(
-                "claude -p returned no structured_output; "
+                "claude -p returned no usable structured output; "
                 f"result was {str(envelope.get('result'))[:300]}"
             )
-        model_id = _resolve_model_id(envelope, self.model)
-        return ExtractionResult(data=data, model_id=model_id, raw=envelope)
+        return ExtractionResult(data=data, model_id=_resolve_model_id(envelope, self.model),
+                                raw=envelope)
+
+
+def _recover_json(result: object) -> dict | None:
+    """Best-effort recovery of a JSON object from a prose `result` string.
+
+    Handles the case where the model emits its answer in a ```json fenced block
+    or as a bare object rather than populating structured_output.
+    """
+    if not isinstance(result, str):
+        return None
+    fence = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", result, re.DOTALL)
+    candidate = fence.group(1) if fence else None
+    if candidate is None:
+        start = result.find("{")
+        end = result.rfind("}")
+        candidate = result[start:end + 1] if 0 <= start < end else None
+    if candidate is None:
+        return None
+    try:
+        parsed = json.loads(candidate)
+    except json.JSONDecodeError:
+        return None
+    return parsed if isinstance(parsed, dict) else None
 
 
 def _resolve_model_id(envelope: dict, requested: str) -> str:
