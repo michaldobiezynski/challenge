@@ -88,49 +88,6 @@ FACT_SCHEMA = {
 }
 
 
-def _canonical(facts: dict) -> tuple:
-    """A hashable projection used to test extraction stability.
-
-    It must include every field a decision depends on, otherwise two passes that
-    disagree on a decision-critical field would be wrongly judged stable. So it
-    carries before_merge (decides ICR-a timing), change_categories (decides the
-    ICR-c exemption), and coverage compared at threshold precision rather than
-    rounded to an integer (which would mask a 79.6 vs 80.4 flip across the 80%
-    line threshold).
-    """
-    author = str(facts.get("pr_author") or "").strip().lower()
-    reviews = sorted(
-        (str(r.get("reviewer") or "").strip().lower(), bool(r.get("is_bot")),
-         str(r.get("state") or ""), _tri(r.get("before_merge")))
-        for r in facts.get("reviews") or []
-    )
-    cats = tuple(sorted(str(c).strip().lower() for c in facts.get("change_categories") or []))
-    cov = facts.get("coverage") or {}
-
-    def side(x, threshold):
-        # Compare which side of the policy threshold the figure falls on, so any
-        # threshold-crossing change is treated as a difference.
-        if not isinstance(x, (int, float)):
-            return None
-        return x >= threshold
-
-    return (
-        author, bool(facts.get("merged")), tuple(reviews), cats,
-        bool(facts.get("coverage_report_present")),
-        (side(cov.get("line"), LINE_MIN), side(cov.get("branch"), BRANCH_MIN),
-         side(cov.get("function"), FUNCTION_MIN)),
-    )
-
-
-def _tri(value) -> str:
-    """Three-valued projection of an optional boolean (True/False/unknown)."""
-    if value is True:
-        return "T"
-    if value is False:
-        return "F"
-    return "?"
-
-
 def assess(control_dir: Path, engine: PerceptionEngine) -> list[AttributeAssessment]:
     """Assess every sample under a control directory.
 
@@ -157,30 +114,65 @@ def _assess_sample(sample_dir: Path, engine: PerceptionEngine) -> list[Attribute
     image_paths = [str(p.resolve()) for p in pngs]
     inputs_hash = {p.name: sha256_file(p) for p in pngs}
 
-    first = engine.extract(SYSTEM_PROMPT, USER_PROMPT, image_paths, FACT_SCHEMA)
-    second = engine.extract(SYSTEM_PROMPT, USER_PROMPT, image_paths, FACT_SCHEMA)
-    stable = _canonical(first.data) == _canonical(second.data)
-    facts = first.data
-
-    common = dict(
-        control=CONTROL_ID, sample=sample_dir.name, extracted_facts=facts,
-        inputs_hash=inputs_hash, model_id=first.model_id, prompt_version=PROMPT_VERSION,
-        evidence=[EvidenceRef(source=p.name, detail="PR screenshot evidence") for p in pngs],
-    )
+    evidence = [EvidenceRef(source=p.name, detail="PR screenshot evidence") for p in pngs]
     assumptions = [
         "Bots (Copilot/dependabot/renovate/github-actions) do not count as "
         "independent human reviewers.",
-        "Perception is LLM-extracted then decided deterministically; extraction is "
-        "run twice and unstable results are downgraded to FURTHER_EVIDENCE_REQUIRED.",
+        "Perception is LLM-extracted then decided deterministically; extraction "
+        "runs twice and an attribute whose verdict differs across the two passes "
+        "is downgraded to FURTHER_EVIDENCE_REQUIRED.",
     ]
 
-    if not stable:
+    # Perception can fail (slow/garbled model output). An auditor who cannot read
+    # the evidence reports FURTHER_EVIDENCE_REQUIRED rather than aborting.
+    try:
+        first = engine.extract(SYSTEM_PROMPT, USER_PROMPT, image_paths, FACT_SCHEMA)
+        second = engine.extract(SYSTEM_PROMPT, USER_PROMPT, image_paths, FACT_SCHEMA)
+    except Exception as exc:  # noqa: BLE001 - any extraction failure -> FER, not crash
+        common = dict(control=CONTROL_ID, sample=sample_dir.name, extracted_facts={},
+                      inputs_hash=inputs_hash, model_id=None,
+                      prompt_version=PROMPT_VERSION, evidence=evidence)
         finding = Finding(type=FindingType.UNSTABLE_EXTRACTION, subject=sample_dir.name,
                           severity=Severity.PROVENANCE,
-                          detail="two extraction passes disagreed on the PR facts")
-        return [_fer(common, assumptions, aid, attr, finding)
-                for aid, attr in _ATTRS]
+                          detail=f"perception failed: {type(exc).__name__}: {str(exc)[:200]}")
+        return [_mk(common, assumptions, aid, attr, Conclusion.FURTHER_EVIDENCE_REQUIRED,
+                    "Could not reliably read the screenshots; evidence required.", 0.2,
+                    findings=[finding]) for aid, attr in _ATTRS]
 
+    def common_for(facts):
+        return dict(control=CONTROL_ID, sample=sample_dir.name, extracted_facts=facts,
+                    inputs_hash=inputs_hash, model_id=first.model_id,
+                    prompt_version=PROMPT_VERSION, evidence=evidence)
+
+    pass1 = {a.attribute_id: a for a in _decide(first.data, common_for(first.data), assumptions)}
+    pass2 = {a.attribute_id: a for a in _decide(second.data, common_for(second.data), assumptions)}
+
+    # Stability is judged on the VERDICTS, not the raw facts: an attribute is only
+    # unstable if the two passes reach different conclusions for it. This covers
+    # every decision-critical field by construction, while harmless differences
+    # (e.g. one pass confident, the other unsure) that do not change the verdict
+    # do not trigger a false FURTHER_EVIDENCE_REQUIRED.
+    out: list[AttributeAssessment] = []
+    common = common_for(first.data)
+    for aid, attr in _ATTRS:
+        a, b = pass1[aid], pass2[aid]
+        if a.conclusion == b.conclusion:
+            out.append(a)
+        else:
+            finding = Finding(
+                type=FindingType.UNSTABLE_EXTRACTION, subject=sample_dir.name,
+                severity=Severity.PROVENANCE,
+                detail=f"two passes disagreed on {aid}: "
+                       f"{a.conclusion.value} vs {b.conclusion.value}")
+            out.append(_mk(common, assumptions, aid, attr,
+                           Conclusion.FURTHER_EVIDENCE_REQUIRED,
+                           f"Extraction unstable for this attribute (passes returned "
+                           f"{a.conclusion.value} and {b.conclusion.value}); not trusted.",
+                           0.3, findings=[finding]))
+    return out
+
+
+def _decide(facts: dict, common: dict, assumptions: list) -> list[AttributeAssessment]:
     return [
         _attr_review_before_merge(facts, common, assumptions),
         _attr_independent_reviewer(facts, common, assumptions),
@@ -290,9 +282,3 @@ def _mk(common, assumptions, aid, attr, conclusion, rationale, confidence,
         policy_clause_cited=policy, assumptions=assumptions,
         agent_findings=findings or [], **common,
     )
-
-
-def _fer(common, assumptions, aid, attr, finding) -> AttributeAssessment:
-    return _mk(common, assumptions, aid, attr, Conclusion.FURTHER_EVIDENCE_REQUIRED,
-               "Extraction was unstable across two passes; facts not trustworthy.",
-               0.3, findings=[finding])
