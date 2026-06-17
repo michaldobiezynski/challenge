@@ -18,6 +18,9 @@ import typer
 from .controls import REGISTRY, detect_control
 from .engine import ClaudeCPEngine, PerceptionEngine, StubEngine
 
+# Controls that need an LLM to perceive their evidence (so the stub cannot serve).
+PERCEPTION_CONTROLS = {"independent-code-review"}
+
 app = typer.Typer(add_completion=False, help="Bead audit agent")
 
 
@@ -65,6 +68,11 @@ def assess(
             if run_all:
                 continue
             raise typer.BadParameter(f"could not resolve a control for {target}")
+        if cid in PERCEPTION_CONTROLS and engine == "stub":
+            raise typer.BadParameter(
+                f"control {cid!r} reads screenshots and needs perception; "
+                "use --engine claude-cp (the stub engine cannot perceive evidence)"
+            )
         assessments.extend(_assess_dir(target, cid, eng))
 
     if not assessments:
