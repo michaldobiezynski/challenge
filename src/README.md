@@ -96,9 +96,11 @@ fact, and a specific cell or screenshot:
 
 For each sample, the screenshots are read into a structured PR fact sheet
 (author, merge actor, reviewers and whether each is a bot, review states and
-ordering relative to the merge, coverage figures). Extraction is run **twice**;
-if the canonical facts diverge the result is downgraded to
-`FURTHER_EVIDENCE_REQUIRED` (`UNSTABLE_EXTRACTION`). Deterministic rules then
+ordering relative to the merge, coverage figures). Extraction is run **twice**
+and decided independently; any attribute whose verdict differs across the two
+passes is downgraded to `FURTHER_EVIDENCE_REQUIRED` (`UNSTABLE_EXTRACTION`),
+which catches instability in exactly the fields that change a decision while
+ignoring harmless confidence-only differences. Deterministic rules then
 assess three attributes: review before merge, independent (human, non-author)
 approval, and testing against `testing-policy.md` (line >= 80%, branch >= 70%,
 function >= 80%), honouring the policy's exception categories.
